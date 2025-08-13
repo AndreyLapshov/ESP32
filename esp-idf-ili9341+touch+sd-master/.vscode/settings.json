@@ -1,0 +1,17 @@
+{
+    "idf.flashType": "UART",
+    "idf.portWin": "COM9",
+    "files.associations": {
+        "st7789.h": "c",
+        "fontx.h": "c",
+        "decode_png.h": "c",
+        "lvgl_port.h": "c",
+        "lv_conf.h": "c",
+        "math.h": "c",
+        "lv_version.h": "c"
+    },
+    "idf.espIdfPathWin": "C:/Espressif/frameworks/esp-idf-v5.4.1/",
+    "idf.toolsPathWin": "C:\\.espressif\\tools",
+    "idf.pythonInstallPath": "C:\\.espressif\\tools\\tools\\idf-python\\3.11.2\\python.exe",
+    "C_Cpp.default.compilerPath": "C:/MinGW/bin/gcc.exe"
+}
