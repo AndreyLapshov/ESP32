@@ -1,648 +1,326 @@
-#include "lvgl.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_ili9341.h"
-#include "esp_lcd_touch.h"
-#include "esp_lcd_touch_xpt2046.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <ctype.h>
 
-#include "driver/spi_master.h"
-#include "driver/gpio.h"
-#include "esp_timer.h"
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "esp_vfs.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-#include "driver/sdspi_host.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "driver/uart.h"
+#include "esp_vfs_dev.h"
 
-#include <dirent.h>    // opendir/readdir/closedir
-/* ==== TFT on SPI2_HOST (existing wiring) ==== */
-#define PIN_MOSI       23
-#define PIN_MISO       19
-#define PIN_CLK        18
-#define PIN_CS_TFT      5
-#define PIN_DC_TFT     27
-#define PIN_RST_TFT    33
-#define PIN_BK_TFT     32
+#include "esp_log.h"
+#include "esp_check.h"
 
+#include "esp_lcd_types.h"
+#include "esp_lcd_panel_interface.h"   // esp_lcd_panel_t / handle
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_dev.h"
+#include "esp_lcd_panel_vendor.h"      // ST7789
 
-/* ==== Touch on SPI3_HOST (new GPIOs) ==== */
-#define PIN_MOSI_TP    13
-#define PIN_MISO_TP    12
-#define PIN_CLK_TP     14
-#define PIN_CS_TP      15
-#define PIN_IRQ_TP      4
+static const char *TAG = "TFT_PROBE";
 
-#define PIN_CS_SD      16
+/* ----- Пины для двух SPI-хостов ----- */
+#define VSPI_MOSI 23
+#define VSPI_SCLK 18
+#define HSPI_MOSI 13
+#define HSPI_SCLK 14
 
-#define LCD_V_OFFSET    0  // при необходимости сдвиг по Y
+/* Управляющие пины */
+#define PIN_CS    5      // для режима CS=GND не подключайте этот провод (в коде cs_gpio_num=-1)
+#define PIN_DC    27
+#define PIN_RST   32
+#define PIN_BL    33
 
-/* Display resolution */
-#define HRES          240
-#define VRES          320
+/* Геометрия и SPI */
+#define LCD_W       240
+#define LCD_H       280
+#define SPI_SAFE_HZ (80 * 1000 * 1000)  // начните с 12 МГц
 
-/* LVGL buffer size (~10 lines) */
-#define BUF_PIXELS (HRES * 40)
-#define BUF_SIZE   (BUF_PIXELS * sizeof(lv_color_t))
-  
-#define LVGL_TICK_PERIOD_MS 2
-#define LVGL_TICK_PERIOD_US (LVGL_TICK_PERIOD_MS * 1000)
-
-
-#define TAG "LVGL_DUAL_SPI"
-
-
-#define MOUNT_POINT "/sdcard"
-#define FILE_NAME "/sdcard/ui.json"
-
-FILE *f = NULL;
-uint32_t file_size = 0;
-unsigned char* file_buf = NULL;
-
-
-
-static lv_display_t          *disp;
-static esp_lcd_panel_handle_t panel_hdl;
-static esp_lcd_touch_handle_t tp_hdl;
-static lv_obj_t              *label;
-
-/* LVGL flush for TFT */
-static void lvgl_flush(lv_display_t *d, const lv_area_t *area, uint8_t *color_p)
+/* ===== UART0: мгновенный приём ok/no или y/n, Enter не обязателен ===== */
+static void uart0_init_console(void)
 {
-    esp_lcd_panel_draw_bitmap(panel_hdl,
-                              area->x1, area->y1,
-                              area->x2 + 1, area->y2 + 1,
-                              color_p);
+    const uart_config_t cfg = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    uart_driver_install(UART_NUM_0, 512, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &cfg);
+    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    esp_vfs_dev_uart_use_driver(UART_NUM_0);
 }
 
-/* TFT transfer-done */
-static bool tft_done_cb(esp_lcd_panel_io_handle_t io,
-                        esp_lcd_panel_io_event_data_t *edata,
-                        void *user_ctx)
+static bool uart_wait_ok_or_no(void)
 {
-    lv_display_flush_ready((lv_display_t *)user_ctx);
-    return true;
+    ESP_LOGW(TAG, "Введите: ok/no (или y/n). Enter НЕ обязателен.");
+    char buf[4]; size_t pos = 0;
+
+    while (1) {
+        uint8_t ch;
+        int n = uart_read_bytes(UART_NUM_0, &ch, 1, portMAX_DELAY);
+        if (n <= 0) continue;
+
+        ch = (uint8_t)tolower((int)ch);
+
+        // Игнорируем перевод строк/пробелы
+        if (ch == '\r' || ch == '\n' || ch == ' ') { pos = 0; continue; }
+
+        // Мгновенно принимаем одиночные 'y' / 'n'
+        if (ch == 'y') { ESP_LOGW(TAG, "Получил 'y' -> OK"); uart_flush_input(UART_NUM_0); return true; }
+        if (ch == 'n') { ESP_LOGW(TAG, "Получил 'n' -> NO"); uart_flush_input(UART_NUM_0); return false; }
+
+        // Копим до 2 символов для 'ok' / 'no'
+        if (pos < sizeof(buf) - 1) buf[pos++] = (char)ch;
+        buf[pos] = '\0';
+
+        if (strcmp(buf, "ok") == 0) { ESP_LOGW(TAG, "Получил 'ok'"); uart_flush_input(UART_NUM_0); return true; }
+        if (strcmp(buf, "no") == 0) { ESP_LOGW(TAG, "Получил 'no'"); uart_flush_input(UART_NUM_0); return false; }
+
+        // Если набралось что-то иное длиной >=2 — сброс и ждём заново
+        if (pos >= 2) pos = 0;
+    }
 }
 
-/* Touch read for LVGL */
-static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+/* ===== Утилиты ===== */
+static inline void gpio_out(int io, int lvl) {
+    if (io < 0) return;
+    gpio_config_t c = {.pin_bit_mask = 1ULL << io, .mode = GPIO_MODE_OUTPUT};
+    gpio_config(&c);
+    gpio_set_level(io, lvl);
+}
+static inline uint16_t bswap16(uint16_t v){ return (uint16_t)((v<<8)|(v>>8)); }
+
+/* Буфер строки — один на всё приложение (в куче) */
+static uint16_t *g_line = NULL;
+static void draw_fill(esp_lcd_panel_handle_t panel, uint16_t c565, int case_no, int fill_no, const char *name)
 {
-    uint16_t x, y; uint8_t cnt = 0;
-    esp_lcd_touch_read_data(tp_hdl);
-    bool pressed = esp_lcd_touch_get_coordinates(tp_hdl, &x, &y, NULL, &cnt, 1);
-    if (pressed && cnt) {
-        data->state   = LV_INDEV_STATE_PRESSED;
-        data->point.x = x;
-        data->point.y = y;
+    if (!g_line) g_line = heap_caps_malloc(LCD_W * sizeof(uint16_t), MALLOC_CAP_DMA);
+    uint16_t px = bswap16(c565);
+    for (int i=0;i<LCD_W;i++) g_line[i] = px;
+
+    ESP_LOGI(TAG, "CASE #%02d — Fill #%d %s", case_no, fill_no, name);
+    for (int y = 0; y < LCD_H; y++) {
+        // x_end,y_end — эксклюзивные
+        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, y, LCD_W, y + 1, g_line));
+    }
+}
+
+/* ===== Кастомная панель NV3030B ===== */
+typedef struct {
+    esp_lcd_panel_t base;
+    esp_lcd_panel_io_handle_t io;
+    int rst, x_gap, y_gap;
+    uint8_t madctl, colmod;
+} nv_panel_t;
+
+static inline esp_err_t nv_tx(nv_panel_t *p, uint8_t cmd, const void *d, size_t n){
+    return esp_lcd_panel_io_tx_param(p->io, cmd, d, n);
+}
+static esp_err_t nv_del(esp_lcd_panel_t *panel){ free(__containerof(panel,nv_panel_t,base)); return ESP_OK; }
+static esp_err_t nv_reset(esp_lcd_panel_t *panel){
+    nv_panel_t *p=__containerof(panel,nv_panel_t,base);
+    if (p->rst>=0){ gpio_set_level(p->rst,0); vTaskDelay(pdMS_TO_TICKS(10)); gpio_set_level(p->rst,1); vTaskDelay(pdMS_TO_TICKS(120)); }
+    return ESP_OK;
+}
+static esp_err_t nv_init(esp_lcd_panel_t *panel){
+    nv_panel_t *p=__containerof(panel,nv_panel_t,base);
+    ESP_RETURN_ON_ERROR(nv_tx(p,0x11,NULL,0),TAG,"SLPOUT"); vTaskDelay(pdMS_TO_TICKS(120));
+    p->colmod=0x55; ESP_RETURN_ON_ERROR(nv_tx(p,0x3A,&p->colmod,1),TAG,"COLMOD");           // 16bpp
+    ESP_RETURN_ON_ERROR(nv_tx(p,0xFE,(uint8_t[]){0x61},1),TAG,"FE61");
+    ESP_RETURN_ON_ERROR(nv_tx(p,0xFE,(uint8_t[]){0x70},1),TAG,"FE70");
+    ESP_RETURN_ON_ERROR(nv_tx(p,0xB6,(uint8_t[]){0x04,0x00,0x9F,0x00,0x02},5),TAG,"B6");
+    ESP_RETURN_ON_ERROR(nv_tx(p,0x36,&p->madctl,1),TAG,"MADCTL");                            // RGB/BGR + ориентация
+    ESP_RETURN_ON_ERROR(nv_tx(p,0x29,NULL,0),TAG,"DISPON"); vTaskDelay(pdMS_TO_TICKS(10));
+    return ESP_OK;
+}
+static esp_err_t nv_set_gap(esp_lcd_panel_t *panel,int x,int y){
+    nv_panel_t *p=__containerof(panel,nv_panel_t,base); p->x_gap=x; p->y_gap=y; return ESP_OK;
+}
+static esp_err_t nv_draw(esp_lcd_panel_t *panel,int xs,int ys,int xe,int ye,const void *color)
+{
+    nv_panel_t *p = __containerof(panel, nv_panel_t, base);
+    if (xe <= xs || ye <= ys) return ESP_OK;  // пустая область — ок
+
+    // ESP-IDF: x_end,y_end — эксклюзивные; контроллер — инклюзивные
+    uint16_t x0 = xs + p->x_gap;
+    uint16_t y0 = ys + p->y_gap;
+    uint16_t x1 = (xe - 1) + p->x_gap;
+    uint16_t y1 = (ye - 1) + p->y_gap;
+
+    uint8_t caset[4] = { x0 >> 8, x0 & 0xFF, x1 >> 8, x1 & 0xFF };
+    uint8_t raset[4] = { y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF };
+    ESP_RETURN_ON_ERROR(nv_tx(p, 0x2A, caset, 4), TAG, "CASET");
+    ESP_RETURN_ON_ERROR(nv_tx(p, 0x2B, raset, 4), TAG, "RASET");
+
+    size_t w = (size_t)(xe - xs);
+    size_t h = (size_t)(ye - ys);
+    return esp_lcd_panel_io_tx_color(p->io, 0x2C, color, w * h * 2);
+}
+static esp_err_t nv_inv(esp_lcd_panel_t *panel,bool inv){ return nv_tx(__containerof(panel,nv_panel_t,base), inv?0x21:0x20, NULL, 0); }
+static esp_err_t nv_on (esp_lcd_panel_t *panel,bool on ){ return nv_tx(__containerof(panel,nv_panel_t,base), on ?0x29:0x28, NULL, 0); }
+
+static esp_err_t new_nv3030b(esp_lcd_panel_io_handle_t io, int rst, bool use_bgr, esp_lcd_panel_handle_t *out)
+{
+    nv_panel_t *p = calloc(1,sizeof(*p));
+    ESP_RETURN_ON_FALSE(p, ESP_ERR_NO_MEM, TAG, "oom");
+    p->io=io; p->rst=rst;
+    p->madctl = use_bgr ? 0x08 : 0x00;   // BGR/RGB
+    p->base.del=nv_del; p->base.reset=nv_reset; p->base.init=nv_init;
+    p->base.draw_bitmap=nv_draw; p->base.set_gap=nv_set_gap;
+    p->base.invert_color=nv_inv; p->base.disp_on_off=nv_on;
+    *out=&p->base; return ESP_OK;
+}
+
+/* ===== Один «тест-кейс» ===== */
+typedef enum { DRV_NV3030B=0, DRV_ST7789=1 } drv_t;
+
+static bool try_one(int case_no,
+                    spi_host_device_t host, int mosi, int sclk,
+                    bool cs_via_pin, drv_t drv, bool bgr, bool inv, int yoff)
+{
+    ESP_LOGW(TAG, "CASE #%02d: host=%s MOSI=%d SCLK=%d  CS=%s  drv=%s  %s  INV=%s  YOFF=%d",
+             case_no, (host==SPI2_HOST)?"SPI2":"SPI3", mosi, sclk,
+             cs_via_pin?"PIN":"GND(-1)", drv==DRV_NV3030B?"NV3030B":"ST7789",
+             bgr?"BGR":"RGB", inv?"ON":"OFF", yoff);
+
+    // BUS
+    spi_bus_config_t bus = {
+        .sclk_io_num = sclk, .mosi_io_num = mosi, .miso_io_num = -1,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = LCD_W*80*2
+    };
+    if (spi_bus_initialize(host, &bus, SPI_DMA_CH_AUTO) != ESP_OK) {
+        ESP_LOGE(TAG, "bus init failed"); return false;
+    }
+
+    // IO
+    esp_lcd_panel_io_handle_t io = NULL;
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .dc_gpio_num = PIN_DC,
+        .cs_gpio_num = cs_via_pin ? PIN_CS : -1,
+        .pclk_hz = SPI_SAFE_HZ,
+        .spi_mode = 0,
+        .lcd_cmd_bits = 8, .lcd_param_bits = 8,
+        .trans_queue_depth = 6,
+        .flags = {.lsb_first=0, .cs_high_active=0, .dc_low_on_data=0},
+    };
+    if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)host, &io_cfg, &io) != ESP_OK) {
+        ESP_LOGE(TAG, "io create failed");
+        spi_bus_free(host);
+        return false;
+    }
+
+    // PANEL
+    esp_lcd_panel_handle_t panel = NULL;
+    esp_err_t err;
+    if (drv == DRV_NV3030B) {
+        err = new_nv3030b(io, PIN_RST, bgr, &panel);
+        if (err==ESP_OK) err = esp_lcd_panel_reset(panel);
+        if (err==ESP_OK) err = esp_lcd_panel_init(panel);
+        if (err==ESP_OK) err = esp_lcd_panel_invert_color(panel, inv);
+        if (err==ESP_OK) err = esp_lcd_panel_set_gap(panel, 0, yoff);
+        if (err==ESP_OK) err = esp_lcd_panel_disp_on_off(panel, true);
     } else {
-        data->state = LV_INDEV_STATE_RELEASED;
+        esp_lcd_panel_dev_config_t cfg = {
+            .reset_gpio_num = PIN_RST,
+            .rgb_ele_order  = bgr ? LCD_RGB_ELEMENT_ORDER_BGR : LCD_RGB_ELEMENT_ORDER_RGB,
+            .bits_per_pixel = 16,
+        };
+        err = esp_lcd_new_panel_st7789(io, &cfg, &panel);
+        if (err==ESP_OK) err = esp_lcd_panel_reset(panel);
+        if (err==ESP_OK) vTaskDelay(pdMS_TO_TICKS(120));
+        if (err==ESP_OK) err = esp_lcd_panel_init(panel);
+        if (err==ESP_OK) err = esp_lcd_panel_invert_color(panel, inv);
+        if (err==ESP_OK) err = esp_lcd_panel_set_gap(panel, 0, yoff);
+        if (err==ESP_OK) err = esp_lcd_panel_disp_on_off(panel, true);
     }
-}
-
-/* LVGL tick (2 ms) */
-static void lv_tick_cb(void *arg)
-{
-    lv_tick_inc(LVGL_TICK_PERIOD_MS);
-}
-
-/* Button click */
-static void btn_event_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-        lv_label_set_text(label, "Pressed");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "panel init failed: 0x%x", err);
+        esp_lcd_panel_io_del(io);
+        spi_bus_free(host);
+        return false;
     }
-}
 
-/* GUI task */
-static void gui_task(void *arg)
-{
-    while (true) {
-        lv_timer_handler();
-        vTaskDelay(pdMS_TO_TICKS(10));
+    // BL ON
+    gpio_set_level(PIN_BL, 1);
+
+    // ТЕСТ: R->G->B (пронумерованы)
+    draw_fill(panel, 0xF800, case_no, 1, "RED");   vTaskDelay(pdMS_TO_TICKS(150));
+    draw_fill(panel, 0x07E0, case_no, 2, "GREEN"); vTaskDelay(pdMS_TO_TICKS(150));
+    draw_fill(panel, 0x001F, case_no, 3, "BLUE");  vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Ждём ok/no
+    bool selected = uart_wait_ok_or_no();
+
+    // Освобождение ресурсов кейса
+    esp_lcd_panel_del(panel);
+    esp_lcd_panel_io_del(io);
+    spi_bus_free(host);
+
+    if (selected) {
+        ESP_LOGW(TAG, "=== SELECTED CASE #%02d ===", case_no);
+        ESP_LOGW(TAG, "host:        %s", (host==SPI2_HOST)?"SPI2_HOST":"SPI3_HOST");
+        ESP_LOGW(TAG, "MOSI (DIN):  %d", mosi);
+        ESP_LOGW(TAG, "SCLK (CLK):  %d", sclk);
+        ESP_LOGW(TAG, "CS mode:     %s", cs_via_pin? "GPIO pin (PIN_CS)" : "GND (cs_gpio_num=-1)");
+        ESP_LOGW(TAG, "driver:      %s", (drv==DRV_NV3030B)?"NV3030B (custom)":"ST7789 (IDF built-in)");
+        ESP_LOGW(TAG, "color order: %s", bgr? "BGR" : "RGB");
+        ESP_LOGW(TAG, "invert:      %s", inv? "ON" : "OFF");
+        ESP_LOGW(TAG, "Y offset:    %d", yoff);
+        ESP_LOGW(TAG, "=====================================");
     }
+
+    return selected; // true => остановиться
 }
 
 void app_main(void)
 {
-    //SD card initialization
+    ESP_LOGI(TAG, "=== TFT auto-probe 240x280 (UART ok/no) ===");
 
-    esp_err_t ret;
+    uart0_init_console();
 
-    ret = gpio_set_pull_mode(PIN_CS_SD, GPIO_PULLUP_ONLY); // CS pin for SD card
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set pull mode for CS pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Pull mode set for CS pin successfully");
-    }
-    ret = gpio_set_direction(PIN_CS_SD, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for CS pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for CS pin successfully");
-    }
-    ret = gpio_set_level(PIN_CS_SD, 1); // Set CS high initially
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set level for CS pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Level set for CS pin successfully");
-    }
-    ret = gpio_set_direction(PIN_MOSI_TP, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for MOSI pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for MOSI pin successfully");
-    }
+    // Подсветка выкл. на старте, DC/RST в дефолт
+    gpio_out(PIN_BL, 0);
+    gpio_out(PIN_DC, 1);
+    gpio_out(PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(PIN_BL, 1); // включим BL
 
-    ret = gpio_set_direction(PIN_MISO_TP, GPIO_MODE_INPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for MISO pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for MISO pin successfully");
-    }
+    const spi_host_device_t hosts[2] = { SPI2_HOST, SPI3_HOST };
+    const int mosi[2] = { VSPI_MOSI, HSPI_MOSI };
+    const int sclk[2] = { VSPI_SCLK, HSPI_SCLK };
+    const bool cs_pin[2] = { true, false };      // true=CS на GPIO5, false=CS=-1 (GND)
+    const drv_t drvs[2] = { DRV_NV3030B, DRV_ST7789 };
+    const bool bgrs[2] = { true, false };
+    const bool invs[2] = { true, false };
+    const int yoffs[3] = { 20, 0, 40 };
 
-    ret = gpio_set_direction(PIN_CLK_TP, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for CLK pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for CLK pin successfully");
+    int case_no = 1;
+    bool done = false;
+
+    for (int h=0; h<2 && !done; ++h)
+    for (int cs=0; cs<2 && !done; ++cs)
+    for (int d=0; d<2 && !done; ++d)
+    for (int c=0; c<2 && !done; ++c)
+    for (int iv=0; iv<2 && !done; ++iv)
+    for (int yo=0; yo<3 && !done; ++yo) {
+        bool selected = try_one(case_no++,
+                                hosts[h], mosi[h], sclk[h],
+                                cs_pin[cs], drvs[d], bgrs[c], invs[iv], yoffs[yo]);
+        if (selected) done = true;
     }
 
-    ret = gpio_set_direction(PIN_CS_TP, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for CS pin: %s", esp_err_to_name(ret));
+    if (!done) {
+        ESP_LOGE(TAG, "Ни один профиль не был подтверждён ('ok'). Проверьте распайку: VCC, GND, DIN(MOSI), CLK, CS, DC, RST, BL.");
     } else {
-        ESP_LOGI(TAG, "Direction set for CS pin successfully");
+        ESP_LOGW(TAG, "Автопоиск завершён по команде 'ok'.");
     }
 
-    ret = gpio_set_level(PIN_CS_TP, 1); // Set CS high initially
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set level for CS pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Level set for CS pin successfully");
-    }
-    ret = gpio_set_direction(PIN_IRQ_TP, GPIO_MODE_INPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for IRQ pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for IRQ pin successfully");
-    }
-    ret = gpio_set_pull_mode(PIN_IRQ_TP, GPIO_PULLUP_ONLY); // Set pull-up for IRQ pin
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set pull mode for IRQ pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Pull mode set for IRQ pin successfully");
-    }
-    ret = gpio_set_pull_mode(PIN_IRQ_TP, GPIO_PULLUP_ONLY); // Pull-up for IRQ pin
-
-    ret = gpio_set_direction(PIN_MOSI, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for MOSI pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for MOSI pin successfully");
-    }
-    ret = gpio_set_direction(PIN_MISO, GPIO_MODE_INPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for MISO pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for MISO pin successfully");
-    }
-    ret = gpio_set_direction(PIN_CLK, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for CLK pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for CLK pin successfully");
-    }
-    ret = gpio_set_pull_mode(PIN_MOSI, GPIO_PULLUP_ONLY); // Set pull-up for MOSI pin
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set pull mode for MOSI pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Pull mode set for MOSI pin successfully");   
-    }
-    ret = gpio_set_pull_mode(PIN_MISO, GPIO_PULLUP_ONLY); // Set pull-up for MISO pin
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set pull mode for MISO pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Pull mode set for MISO pin successfully");
-    }
-    ret = gpio_set_pull_mode(PIN_CLK, GPIO_PULLUP_ONLY); // Set pull-up for CLK pin
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set pull mode for CLK pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Pull mode set for CLK pin successfully");
-    }
-    ret = gpio_set_direction(PIN_CS_TFT, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for CS pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for CS pin successfully");
-    }
-    ret = gpio_set_level(PIN_CS_TFT, 1); // Set CS high initially
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set level for CS pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Level set for CS pin successfully");
-    }
-    ret = gpio_set_direction(PIN_DC_TFT, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for DC pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for DC pin successfully");
-    }
-    ret = gpio_set_direction(PIN_RST_TFT, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for RST pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for RST pin successfully");
-    }
-    ret = gpio_set_direction(PIN_BK_TFT, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set direction for BK pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Direction set for BK pin successfully");
-    }
-    ret = gpio_set_level(PIN_BK_TFT, 0); // Set backlight on
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set level for BK pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Level set for BK pin successfully");
-    }
-    ret = gpio_set_level(PIN_RST_TFT, 1); // Set reset low initially
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set level for RST pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Level set for RST pin successfully");
-    }
-    ret = gpio_set_level(PIN_RST_TFT, 0); // Reset the TFT
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set level for RST pin: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Level set for RST pin successfully");
-    }
-    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for reset
-
-        // 1) Монтируем SD-карту по SPI
-    sdmmc_card_t *card = NULL;
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num     = PIN_MOSI_TP,
-        .miso_io_num     = PIN_MISO_TP,
-        .sclk_io_num     = PIN_CLK_TP,
-        .quadwp_io_num   = -1,
-        .quadhd_io_num   = -1,
-        .max_transfer_sz = 8000,
-    };
-    sdmmc_host_t host = {
-        .flags              = SDMMC_HOST_FLAG_SPI | SDMMC_HOST_FLAG_DEINIT_ARG,
-        .slot               = SPI3_HOST,           // нужный SPI-хост
-        .max_freq_khz       = 2000,                // 2 MHz
-        .io_voltage         = 3.3f,
-        .driver_strength    = SDMMC_DRIVER_STRENGTH_B,
-        .current_limit      = SDMMC_CURRENT_LIMIT_200MA,
-        .init               = sdspi_host_init,
-        .set_card_clk       = sdspi_host_set_card_clk,
-        .do_transaction     = sdspi_host_do_transaction,
-        .deinit_p           = sdspi_host_remove_device,
-        .io_int_enable      = sdspi_host_io_int_enable,
-        .io_int_wait        = sdspi_host_io_int_wait,
-        .get_real_freq      = sdspi_host_get_real_freq,
-        .input_delay_phase  = SDMMC_DELAY_PHASE_0,
-        .get_dma_info       = sdspi_host_get_dma_info,
-        .command_timeout_ms = 0,
-
-    };
-    ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
-    
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));        
-    }
-    sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_cfg.gpio_cs = PIN_CS_SD;
-    slot_cfg.host_id = host.slot;
-    esp_vfs_fat_sdmmc_mount_config_t mnt_cfg = {
-        .format_if_mount_failed = false,
-        .max_files              = 5,
-    };
-    ret =  esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_cfg, &mnt_cfg, &card);
-    if (card) {
-        if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
-            } else {
-                ESP_LOGI(TAG, "SD mounted, cap=%lluGB",
-                    (card->csd.capacity * card->csd.sector_size) / (1024ULL*1024ULL*1024ULL*1024ULL));
-                ESP_LOGI(TAG, "=== SD Card Info ===");
-                sdmmc_card_print_info(stdout, card);
-            }
-    
-
-        DIR *dir = opendir(MOUNT_POINT);
-        if (dir) {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != NULL) {
-                ESP_LOGI(TAG, "Found: %s", entry->d_name);
-            }
-            closedir(dir);
-        } else {
-            ESP_LOGE(TAG, "Failed to open directory: %s", MOUNT_POINT);
-        }
-
-        f = fopen(MOUNT_POINT "/ui.json", "r");
-        if (!f) {
-            ESP_LOGE(TAG, "Failed to open ui.json for reading");
-            //return;
-        }
-
-
-        // Определяем размер файла
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            long file_size = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            ESP_LOGI(TAG, "File size: %ld bytes", file_size);
-
-            // Выделяем буфер (+1 для нуль-терминатора)
-            file_buf = malloc(file_size + 1);
-            if (!file_buf) {
-                ESP_LOGE(TAG, "Failed to allocate buffer (%ld bytes)", file_size + 1);
-                //fclose(f);
-            
-            }
-        
-
-            // Читаем весь файл в буфер
-            size_t read_len = fread(file_buf, 1, file_size, f);
-            file_buf[read_len] = '\0';  // Нуль-терминатор
-            if (read_len != file_size) {
-                ESP_LOGE(TAG, "Failed to read the entire file: expected %ld bytes, got %zu bytes", file_size, read_len);
-                //fclose(f);
-                //free(file_buf);
-            } else {
-                ESP_LOGI(TAG, "Read ui.json successfully: %zu bytes", read_len);
-            }
-        
-
-
-            ESP_LOGI(TAG, "FILE:");
-            char *line = calloc(1024, sizeof(char)); // Буфер для чтения строк
-            if (!line) {
-                ESP_LOGE(TAG, "Failed to allocate line buffer");
-                //fclose(f);
-                //free(file_buf);
-                //return;
-            } else {
-                ESP_LOGI(TAG, "Line buffer allocated successfully");
-            }
-            
-            
-            // Читаем файл построчно и выводим в лог
-            // fgets сохраняет перевод строки, ESP_LOGI добавляет свой
-            
-            rewind(f);  // на всякий случай ставим в начало
-            if (line) {
-                while (fgets(line,255, f)) {
-                    // fgets сохраняет перевод строки, ESP_LOGI добавляет свой
-                    ESP_LOGI(TAG, "%s", line);
-                }
-                free(line);
-            } else {
-                ESP_LOGE(TAG, "Failed to read file line by line");
-            }
-
-        }
-
-        if (file_buf)
-            free(file_buf);
-        // Закрываем файл и освобождаем память
-        if (f) 
-            fclose(f);
-
-        // Отмонтируем файловую систему и освободим SPI-шину
-        ret = esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to unmount SD card: %s", esp_err_to_name(ret));
-        } else {
-            ESP_LOGI(TAG, "SD card unmounted successfully");
-        }
-
-        
-    }
-    // //SdCard work finished 
-    ret = spi_bus_free(host.slot);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to free SPI bus: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "SPI bus freed successfully");
-    }
-
-    /* LVGL init */
-    lv_init();
-    static lv_color_t *buf1 = NULL, *buf2 = NULL;
-    buf1 = heap_caps_malloc(BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    buf2 = heap_caps_malloc(BUF_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    disp = lv_display_create(HRES, VRES);
-    lv_display_set_buffers(disp, buf1, buf2, BUF_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_flush_cb(disp, lvgl_flush);
-
-    // /* Backlight */
-    gpio_config_t bk_cfg = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << PIN_BK_TFT
-    };
-    ret = gpio_config(&bk_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure backlight GPIO: %s", esp_err_to_name(ret));
-    }else {
-        ESP_LOGI(TAG, "Backlight GPIO configured successfully");
-    }
-    ret = gpio_set_level(PIN_BK_TFT, 1);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set backlight GPIO level: %s", esp_err_to_name(ret));
-    } else {
-       ESP_LOGI(TAG, "Backlight GPIO level set successfully");
-    }
-
-    /* SPI2_HOST for TFT */
-    spi_bus_config_t spi2_cfg = {
-        .sclk_io_num    = PIN_CLK,
-        .mosi_io_num    = PIN_MOSI,
-        .miso_io_num    = PIN_MISO,
-        .max_transfer_sz= BUF_SIZE
-    };
-    ret = spi_bus_initialize(SPI2_HOST, &spi2_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SPI bus for TFT: %s", esp_err_to_name(ret));
-        
-    } else {
-        ESP_LOGI(TAG, "SPI bus for TFT initialized successfully");
-    }
-
-    /* SPI3_HOST for Touch */
-    spi_bus_config_t spi3_cfg = {
-        .sclk_io_num    = PIN_CLK_TP,
-        .mosi_io_num    = PIN_MOSI_TP,
-        .miso_io_num    = PIN_MISO_TP,
-        .max_transfer_sz= 0
-    };
-    ret = spi_bus_initialize(SPI3_HOST, &spi3_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SPI bus for Touch: %s", esp_err_to_name(ret));
-        
-    } else {
-         ESP_LOGI(TAG, "SPI bus for Touch initialized successfully");
-    }
-
-    /* TFT panel I/O */
-    esp_lcd_panel_io_handle_t io_tft;
-    esp_lcd_panel_io_spi_config_t tft_io_cfg = {
-        .dc_gpio_num            = PIN_DC_TFT,
-        .cs_gpio_num            = PIN_CS_TFT,
-        .pclk_hz                = 40 * 1000 * 1000,
-        .lcd_cmd_bits           = 8,
-        .lcd_param_bits         = 8,
-        .spi_mode               = 0,
-        .trans_queue_depth      = 10,
-        .on_color_trans_done    = tft_done_cb,
-        .user_ctx               = disp,
-     };
-    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,&tft_io_cfg, &io_tft);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create TFT panel I/O: %s", esp_err_to_name(ret));
-    
-    } else {
-        ESP_LOGI(TAG, "TFT panel I/O created successfully");
-    }
-
-    esp_lcd_panel_dev_config_t panel_cfg = {
-        .reset_gpio_num = PIN_RST_TFT,
-        .color_space    = ESP_LCD_COLOR_SPACE_BGR,
-        .bits_per_pixel = 16,
-    };
-    ret = esp_lcd_new_panel_ili9341(io_tft, &panel_cfg, &panel_hdl);
-    if (ret != ESP_OK) {
-         ESP_LOGE(TAG, "Failed to create TFT panel: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "TFT panel created successfully");
-    }
-    /* Added user snippet: */
-    ret = esp_lcd_panel_reset(panel_hdl);
-    if (ret != ESP_OK) {
-       ESP_LOGE(TAG, "Failed to reset TFT panel: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "TFT panel reset successfully");
-    }
-    ret = esp_lcd_panel_init(panel_hdl);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize TFT panel: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "TFT panel initialized successfully");
-    }
-    ret = esp_lcd_panel_invert_color(panel_hdl, false);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to invert TFT panel color: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "TFT panel color inversion set successfully");
-    }
-    ret = esp_lcd_panel_mirror(panel_hdl, false, true);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mirror TFT panel: %s", esp_err_to_name(ret));
-    } else {    
-        ESP_LOGI(TAG, "TFT panel mirroring set successfully");
-    }
-    ret = esp_lcd_panel_swap_xy(panel_hdl, false);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "TFT panel Failed to swap XY: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "TFT panel swap XY set successfully");
-    }
-    ret = esp_lcd_panel_set_gap(panel_hdl, 0, LCD_V_OFFSET);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set TFT panel gap: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "TFT panel gap set successfully");
-    }
-    ret = esp_lcd_panel_disp_on_off(panel_hdl, true);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to turn on TFT panel: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "TFT panel turned on successfully");
-    }
-    
-
-    /* Touch panel I/O */
-    esp_lcd_panel_io_handle_t io_tp;
-    esp_lcd_panel_io_spi_config_t tp_io_cfg = {
-        .dc_gpio_num       = -1,
-        .cs_gpio_num       = PIN_CS_TP,
-        .pclk_hz           = 2 * 1000 * 1000,
-        .lcd_cmd_bits      = 8,
-        .lcd_param_bits    = 8,
-        .spi_mode          = 0,
-        .trans_queue_depth = 4,
-    };
-    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI3_HOST,
-                                            &tp_io_cfg, &io_tp);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create touch panel I/O: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Touch panel I/O created successfully");
-    }
-    esp_lcd_touch_config_t touch_cfg = {
-        .x_max        = HRES,
-        .y_max        = VRES,
-        .rst_gpio_num = -1,
-        .int_gpio_num = PIN_IRQ_TP,
-        .levels       = { .reset = 0, .interrupt = 0 },
-    };
-    ret = esp_lcd_touch_new_spi_xpt2046(io_tp, &touch_cfg, &tp_hdl);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create touch panel: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "Touch panel created successfully");
-    }
-
-    /* LVGL input device */
-    lv_indev_t *indev = lv_indev_create();
-    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-    lv_indev_set_read_cb(indev, touch_read_cb);
-
-    /* LVGL tick timer */
-    const esp_timer_create_args_t tick_args = {
-        .callback = lv_tick_cb,
-        .name     = "lv_tick"
-    };
-    esp_timer_handle_t tick_timer;
-    ret = esp_timer_create(&tick_args, &tick_timer);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create LVGL tick timer: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "LVGL tick timer created successfully");
-    }
-
-    ret = esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_US);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start LVGL tick timer: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "LVGL tick timer started successfully");
-    }
-
-
-    /* Build UI */
-    label = lv_label_create(lv_scr_act());
-    lv_label_set_text(label, "Hello ILI9341");
-    lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 30);
-
-    lv_obj_t *btn = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(btn, 100, 40);
-    lv_obj_align(btn, LV_ALIGN_CENTER, 0, 20);
-    lv_obj_set_style_bg_color(btn, lv_color_make(0,127,255), 0);
-    lv_obj_set_style_radius(btn, 10, 0);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, "PRESS");
-    lv_obj_center(lbl);
-    lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-    /* Start GUI task */
-    xTaskCreatePinnedToCore(gui_task, "gui", 4096, NULL, 2, NULL, 1);
-    vTaskDelete(NULL);
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
 }

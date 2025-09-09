@@ -1,0 +1,29 @@
+dependencies:
+  espressif/mpu6050:
+    component_hash: d69219ccb141372b863c511749ffbeab28417ac71c205d7ed7030c308e1b6832
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.0
+  idf:
+    source:
+      type: idf
+    version: 5.4.1
+  nopnop2002/ssd1306:
+    component_hash: 6b7041f67f741708947c72b707087520100486286df9bc1536b42c46040c577b
+    dependencies: []
+    source:
+      git: https://github.com/nopnop2002/esp-idf-ssd1306.git
+      path: components/ssd1306
+      type: git
+    version: ddcb2a33daee4723ad8062714e72ba0208462613
+direct_dependencies:
+- espressif/mpu6050
+- nopnop2002/ssd1306
+manifest_hash: d781d26d8534eb1a8f905e640e61d18ad5d3469cdcbc7535c7483c12899ee7f8
+target: esp32
+version: 2.0.0
